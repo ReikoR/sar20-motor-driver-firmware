@@ -62,6 +62,8 @@ void Error_Handler(void);
 /* Private defines -----------------------------------------------------------*/
 #define LED_Pin GPIO_PIN_3
 #define LED_GPIO_Port GPIOA
+#define DRV_EN_Pin GPIO_PIN_12
+#define DRV_EN_GPIO_Port GPIOA
 #define DRV_CS_Pin GPIO_PIN_15
 #define DRV_CS_GPIO_Port GPIOA
 /* USER CODE BEGIN Private defines */

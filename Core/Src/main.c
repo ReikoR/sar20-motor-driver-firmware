@@ -19,6 +19,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "drv8323.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -70,6 +71,7 @@ static void MX_USART1_UART_Init(void);
 typedef struct DebugInfo {
   uint16_t rawPositionSensorValue;
   uint16_t mechAngleRaw;
+  uint16_t driverRegister1;
 } DebugInfo;
 
 
@@ -176,12 +178,29 @@ int main(void)
   MX_TIM4_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  HAL_GPIO_WritePin(DRV_CS_GPIO_Port, DRV_CS_Pin, GPIO_PIN_SET);
+  __HAL_SPI_ENABLE(&hspi3);
+
+  HAL_GPIO_WritePin(DRV_EN_GPIO_Port, DRV_EN_Pin, GPIO_PIN_SET); // enable DRV8323
+
+  HAL_Delay(1); // SPI ready after enable < 1ms
+
+  DRV8323_writeRegister(
+      &hspi3,
+      DRV_CS_GPIO_Port,
+      DRV_CS_Pin,
+      DRV8323_RegisterAddress_driver_control,
+      DRV8323_driver_control_PWM_mode_3x
+  );
+
+  uint16_t driverControlRegisterValue = DRV8323_readRegister(
+      &hspi3,
+      DRV_CS_GPIO_Port,
+      DRV_CS_Pin,
+      DRV8323_RegisterAddress_driver_control
+  );
 
   SPI_TransmitReceive_DMA_Setup(&hspi3, (uint32_t)positionSensorTxData, (uint32_t)positionSensorRxData, 1);
   HAL_DMA_Start(&hdma_tim4_ch2, positionSensorTxData, (uint32_t)&SPI3->DR, 1);
-
-  __HAL_SPI_ENABLE(&hspi3);
 
   __HAL_TIM_ENABLE_DMA(&htim4, TIM_DMA_CC2);
   HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);
@@ -191,7 +210,8 @@ int main(void)
 
   volatile DebugInfo debugInfo = {
       .rawPositionSensorValue = 0,
-      .mechAngleRaw = 0
+      .mechAngleRaw = 0,
+      .driverRegister1 = driverControlRegisterValue
   };
   /* USER CODE END 2 */
 
@@ -451,10 +471,10 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, LED_Pin|DRV_CS_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, LED_Pin|DRV_EN_Pin|DRV_CS_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : LED_Pin DRV_CS_Pin */
-  GPIO_InitStruct.Pin = LED_Pin|DRV_CS_Pin;
+  /*Configure GPIO pins : LED_Pin DRV_EN_Pin DRV_CS_Pin */
+  GPIO_InitStruct.Pin = LED_Pin|DRV_EN_Pin|DRV_CS_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
