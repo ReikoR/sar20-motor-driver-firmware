@@ -184,18 +184,18 @@ int limit(int value, int min, int max) {
 
 enum ControlState controlState = Idle;
 
-uint16_t positionSensorTxData[1] = {0x7fff};
+uint16_t positionSensorTxData[1] = {0x0000};
 uint16_t positionSensorRxData[1];
 
 uint8_t uartRxData = 0;
 
-const int zeroOffset = 0x530;
+const int zeroOffset = 6800;
 const int polePairs = 7;
-const int mechCounts = 16384;
+//const int mechCounts = 65536;
 
 uint16_t mechAngleRaw = 0;
-const float fElecCounts = 2340.57142857f;
-const uint16_t elecCounts = 2340;
+const float fElecCounts = 9362.2857f; // 2^16 / 7
+const uint16_t elecCounts = 9362;
 volatile float fElecAngle = 0.0f;
 float busV = 12.0f;
 
@@ -300,9 +300,9 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
       return;
   }
 
-  mechAngleRaw = positionSensorRxData[0] & 0x3fff;
+  mechAngleRaw = positionSensorRxData[0];
   prevPosition = position;
-  position = mechAngleRaw << 2;
+  position = mechAngleRaw;
   deltaPosition = position - prevPosition;
   WindowedAverage_Add(&speedWindowedAverage, deltaPosition);
   speed_Hz = 0.96f * speed_Hz + 0.04f * (float)speedWindowedAverage.total_ * velocity_scale * kRateHz / (float)speedWindowedAverage.size_;
@@ -359,13 +359,18 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
   htim1.Instance->CCR2 = bDuty;
   htim1.Instance->CCR3 = aDuty;
 
-  /*TIM1->CCR1 = 2200;
-  TIM1->CCR2 = 1900;
-  TIM1->CCR3 = 1900;*/
+  // For finding angle sensor zero offset
+  /*TIM1->CCR1 = 1800;
+  TIM1->CCR2 = 1800;
+  TIM1->CCR3 = 2400;*/
 
   /*TIM1->CCR1 = 2000;
   TIM1->CCR2 = 2000;
   TIM1->CCR3 = 2000;*/
+
+  /*IM1->CCR1 = 0;
+  TIM1->CCR2 = 0;
+  TIM1->CCR3 = 0;*/
 
   DEBUG1_GPIO_Port->BRR = DEBUG1_Pin;
 }
@@ -410,6 +415,9 @@ void setControlState(enum ControlState newControlState) {
 
       // Change SPI frequency to 10 MHz for angle sensor
       MODIFY_REG(hspi3.Instance->CR1, SPI_CR1_BR_Msk, SPI_BAUDRATEPRESCALER_16);
+
+      // Change SPI mode from 1 to 0
+      MODIFY_REG(hspi3.Instance->CR1, SPI_CR1_CPHA_Msk, SPI_PHASE_1EDGE);
 
       SPI_TransmitReceive_DMA_Setup(&hspi3, (uint32_t)positionSensorTxData, (uint32_t)positionSensorRxData, 1);
       HAL_DMA_Start(&hdma_tim4_ch2, positionSensorTxData, (uint32_t)&SPI3->DR, 1);
