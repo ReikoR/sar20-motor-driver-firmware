@@ -29,4 +29,9 @@ float PI_Control_update(PI_Control* control, float ref, float feedback) {
 	return output;
 }
 
+float PI_Control_reset(PI_Control* control) {
+  control->i = 0.0f;
+  control->prevError = 0.0f;
+}
+
 #endif /* INC_PID_H_ */

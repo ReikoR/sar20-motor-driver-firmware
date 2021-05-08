@@ -26,6 +26,7 @@
 #include "foc.h"
 #include "pid.h"
 #include "windowed_average.h"
+#include "eeprom_emul.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -55,10 +56,17 @@ typedef struct __attribute__((packed)) DebugInfo {
   uint16_t delimiter;
 } DebugInfo;
 
+typedef struct __attribute__((packed)) DebugCommand {
+  float speedHz;
+  uint8_t calibrateAngle;
+  uint8_t checkSum;
+} DebugCommand;
+
 
 enum ControlState {
   Idle,
   CalibratingDriver,
+  Ready,
   CalibratingAngle,
   Active
 };
@@ -187,9 +195,10 @@ enum ControlState controlState = Idle;
 uint16_t positionSensorTxData[1] = {0x0000};
 uint16_t positionSensorRxData[1];
 
-uint8_t uartRxData = 0;
+uint8_t uartRxDataDMA[6] = {0, 0, 0, 0, 0, 0};
+uint8_t uartRxData[6] = {0, 0, 0, 0, 0, 0};
 
-const int zeroOffset = 6800;
+uint16_t zeroOffset = 6800;
 const int polePairs = 7;
 //const int mechCounts = 65536;
 
@@ -257,6 +266,14 @@ PI_Control speedPI = {.pGain = 0.08f, .iGain = 0.00004f, .dGain = 0.0f, .maxI = 
 float iqPIout = 0.0f;
 float idPIout = 0.0f;
 
+int isAngleSensorActive = 0;
+int isCalibratingAngle = 0;
+float angleCalibrationCurrent = 0.5f;
+volatile float angleCalibrationSetpoint = 0.0f;
+SinCosResult scAngleCalibration = {.c = 0.0f, .s = 0.0f};
+float angleCalibrationDirection = 1.0f;
+int angleAtZeroCounter = 0;
+
 volatile DebugInfo debugInfo = {
     .rawPositionSensorValue = 0,
     .mechAngleRaw = 0,
@@ -271,6 +288,12 @@ volatile DebugInfo debugInfo = {
     .bVoltageOffset = 0,
     .deltaPosition = 0,
     .delimiter = 0xAAAA
+};
+
+volatile DebugCommand debugCommand = {
+    .speedHz = 0.0f,
+    .calibrateAngle = 0,
+    .checkSum = 0
 };
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
@@ -296,22 +319,22 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
     return;
   }
 
-  if (controlState < CalibratingAngle) {
-      return;
+  if (controlState < Ready) {
+    return;
   }
 
   mechAngleRaw = positionSensorRxData[0];
   prevPosition = position;
-  position = mechAngleRaw;
+  position = mechAngleRaw - zeroOffset;
   deltaPosition = position - prevPosition;
   WindowedAverage_Add(&speedWindowedAverage, deltaPosition);
   speed_Hz = 0.96f * speed_Hz + 0.04f * (float)speedWindowedAverage.total_ * velocity_scale * kRateHz / (float)speedWindowedAverage.size_;
 
-  if (controlState < Active) {
-      return;
+  if (controlState < CalibratingAngle) {
+    return;
   }
 
-  fElecAngle = (float)((mechAngleRaw - zeroOffset) % elecCounts);
+  fElecAngle = (float)(position % elecCounts);
   fElecAngle = fElecAngle / fElecCounts * k2Pi;
 
   if (fElecAngle < 0.0f) fElecAngle += k2Pi;
@@ -331,20 +354,59 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 
   busV = (float)adcData[1] * ratioAdcToBusV;
 
-  //speedRef = 2.0f;
-  speedRef = (float)(int8_t)uartRxData / 10.0f;
-
   //InverseDqTransform(&sc, 0.0f, 0.8f, &abc); // voltage
 
   DqTransform(&sc, aI, bI, cI, &dqI); // current
 
   //iqRef = 0.2f;
-  iqRef = PI_Control_update(&speedPI, speedRef, speed_Hz);
+  if (controlState == CalibratingAngle) {
+    idRef = angleCalibrationCurrent;
+    iqRef = 0.0f;
+
+    angleCalibrationSetpoint += angleCalibrationDirection * 0.01f;
+
+    if (mechAngleRaw > elecCounts) {
+      angleCalibrationDirection = -1.0f;
+      angleAtZeroCounter = 0;
+    } else {
+      if (angleCalibrationSetpoint > 0.1f) {
+        angleCalibrationDirection = -1.0f;
+      } else {
+        angleCalibrationSetpoint = 0.0f;
+      }
+    }
+
+    if (mechAngleRaw < elecCounts && angleCalibrationSetpoint == 0.0f) {
+      angleAtZeroCounter++;
+
+      if (angleAtZeroCounter == 10000) {
+        zeroOffset = mechAngleRaw;
+        isCalibratingAngle = 0;
+      }
+    }
+
+    if (angleCalibrationSetpoint > k2Pi) {
+      angleCalibrationSetpoint -= k2Pi;
+    } else if (angleCalibrationSetpoint < 0) {
+      angleCalibrationSetpoint += k2Pi;
+    }
+
+    SinCos(angleCalibrationSetpoint, &scAngleCalibration);
+    DqTransform(&scAngleCalibration, aI, bI, cI, &dqI);
+  } else if (controlState == Active) {
+    DqTransform(&sc, aI, bI, cI, &dqI); // current
+    idRef = 0.0f;
+    iqRef = PI_Control_update(&speedPI, speedRef, speed_Hz);
+  }
 
   iqPIout = PI_Control_update(&iqPI, iqRef, dqI.q);
   idPIout = PI_Control_update(&idPI, idRef, dqI.d);
 
-  InverseDqTransform(&sc, idPIout, iqPIout, &abc); // current
+  if (controlState == CalibratingAngle) {
+    InverseDqTransform(&scAngleCalibration, idPIout, iqPIout, &abc);
+  } else if (controlState == Active) {
+    InverseDqTransform(&sc, idPIout, iqPIout, &abc); // current
+  }
 
   // Voltage to PWM
   aV = 0.5f + abc.a / busV;
@@ -375,12 +437,37 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
   DEBUG1_GPIO_Port->BRR = DEBUG1_Pin;
 }
 
+void startAngleSensor() {
+  if (isAngleSensorActive) {
+    return;
+  }
+
+  isAngleSensorActive = 1;
+
+  /*DRV8323_writeRegister(
+      &hspi3,
+      DRV_CS_GPIO_Port,
+      DRV_CS_Pin,
+      DRV8323_RegisterAddress_CSA_control,
+      DRV8323_CSA_control_bidirectional_mode |
+      DRV8323_CSA_control_gain_20 |
+      DRV8323_CSA_control_sense_overcurrent_level_1V
+  );*/
+
+  // Change SPI frequency to 10 MHz for angle sensor
+  MODIFY_REG(hspi3.Instance->CR1, SPI_CR1_BR_Msk, SPI_BAUDRATEPRESCALER_16);
+
+  // Change SPI mode from 1 to 0
+  MODIFY_REG(hspi3.Instance->CR1, SPI_CR1_CPHA_Msk, SPI_PHASE_1EDGE);
+
+  SPI_TransmitReceive_DMA_Setup(&hspi3, (uint32_t)positionSensorTxData, (uint32_t)positionSensorRxData, 1);
+  HAL_DMA_Start(&hdma_tim4_ch2, positionSensorTxData, (uint32_t)&SPI3->DR, 1);
+}
+
 void setControlState(enum ControlState newControlState) {
   if (controlState == newControlState) {
     return;
   }
-
-  controlState = newControlState;
 
   switch (newControlState) {
   case Idle:
@@ -402,29 +489,19 @@ void setControlState(enum ControlState newControlState) {
     isMeasuringCurrentOffsets = 1;
 
     break;
+  case Ready:
+    startAngleSensor();
+    break;
   case CalibratingAngle:
-    /*DRV8323_writeRegister(
-          &hspi3,
-          DRV_CS_GPIO_Port,
-          DRV_CS_Pin,
-          DRV8323_RegisterAddress_CSA_control,
-          DRV8323_CSA_control_bidirectional_mode |
-          DRV8323_CSA_control_gain_20 |
-          DRV8323_CSA_control_sense_overcurrent_level_1V
-      );*/
-
-      // Change SPI frequency to 10 MHz for angle sensor
-      MODIFY_REG(hspi3.Instance->CR1, SPI_CR1_BR_Msk, SPI_BAUDRATEPRESCALER_16);
-
-      // Change SPI mode from 1 to 0
-      MODIFY_REG(hspi3.Instance->CR1, SPI_CR1_CPHA_Msk, SPI_PHASE_1EDGE);
-
-      SPI_TransmitReceive_DMA_Setup(&hspi3, (uint32_t)positionSensorTxData, (uint32_t)positionSensorRxData, 1);
-      HAL_DMA_Start(&hdma_tim4_ch2, positionSensorTxData, (uint32_t)&SPI3->DR, 1);
+    isCalibratingAngle = 1;
+    startAngleSensor();
     break;
   case Active:
+    startAngleSensor();
     break;
   }
+
+  controlState = newControlState;
 }
 /* USER CODE END 0 */
 
@@ -488,6 +565,16 @@ int main(void)
       DRV_CS_Pin,
       DRV8323_RegisterAddress_driver_control
   );*/
+  EE_Status ee_status = EE_OK;
+
+  HAL_FLASH_Unlock();
+
+  ee_status = EE_Init(EE_FORCED_ERASE);
+  if(ee_status != EE_OK) {Error_Handler();}
+
+  EE_ReadVariable16bits(1, &zeroOffset);
+
+  HAL_FLASH_Lock();
 
   htim4.Instance->CCR1 = 32;
   htim4.Instance->CCR2 = 64;
@@ -497,7 +584,7 @@ int main(void)
   HAL_ADC_Start_DMA(&hadc1, adcData, 2);
   HAL_ADC_Start_IT(&hadc1);
 
-  HAL_UART_Receive_DMA(&huart1, &uartRxData, 1);
+  HAL_UART_Receive_DMA(&huart1, &uartRxDataDMA, sizeof(uartRxDataDMA));
 
   // sets offset before timer is started to align TIM4 CH2 DMA request that triggers SPI3 data transfer,
   // should happen after the ADC sampling is done and before ADC sequence end interrupt
@@ -531,16 +618,52 @@ int main(void)
     /* USER CODE BEGIN 3 */
     HAL_Delay(100);
 
-    if (controlState == CalibratingAngle) {
-      // Calibration has ended
-      setControlState(Active);
-    } else if (controlState == CalibratingDriver && isMeasuringCurrentOffsets == 0) {
-      // Calibration has ended
-      setControlState(CalibratingAngle);
+    if (controlState == CalibratingDriver && isMeasuringCurrentOffsets == 0) {
+      // Current offset calibration has ended
+      setControlState(Ready);
+    } else if (controlState == CalibratingAngle && isCalibratingAngle == 0) {
+      // Angle calibration has ended
+      HAL_FLASH_Unlock();
+      EE_WriteVariable16bits(1, zeroOffset);
+      HAL_FLASH_Lock();
+      setControlState(Ready);
+    }
+
+    uint32_t uartRxDMACounter = __HAL_DMA_GET_COUNTER(huart1.hdmarx);
+    uint32_t firstByteIndex = sizeof(uartRxData) - uartRxDMACounter;
+    uint8_t calculatedCheckSum = 0;
+
+    for (uint32_t i = 0; i < sizeof(uartRxData); i++) {
+      uint32_t byteIndex = firstByteIndex + i;
+
+      if (byteIndex >= sizeof(uartRxData)) {
+        byteIndex -= sizeof(uartRxData);
+      }
+
+      uartRxData[i] = uartRxDataDMA[byteIndex];
+
+      if (i != sizeof(uartRxData) - 1) {
+        calculatedCheckSum += uartRxData[i];
+      }
+    }
+
+    if (calculatedCheckSum == uartRxData[sizeof(uartRxData) - 1]) {
+      uint8_t prevCalibrateAngle = debugCommand.calibrateAngle;
+
+      memcpy(&debugCommand, uartRxData, sizeof(uartRxData));
+
+      speedRef = debugCommand.speedHz;
+
+      if (prevCalibrateAngle == 0 && debugCommand.calibrateAngle == 1) {
+        setControlState(CalibratingAngle);
+      } else if (controlState == Ready && speedRef != 0.0f) {
+        setControlState(Active);
+      }
     }
 
     HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
 
+    debugInfo.driverRegister1 = zeroOffset;
     debugInfo.rawPositionSensorValue = positionSensorRxData[0];
     debugInfo.mechAngleRaw = mechAngleRaw;
     debugInfo.deltaPosition = deltaPosition;
@@ -849,18 +972,15 @@ static void MX_TIM1_Init(void)
   {
     Error_Handler();
   }
-  sConfigOC.Pulse = 0;
   if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
   {
     Error_Handler();
   }
-  sConfigOC.Pulse = 0;
   if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
   {
     Error_Handler();
   }
   sConfigOC.Pulse = 1;
-  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
   if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
   {
     Error_Handler();
@@ -947,7 +1067,6 @@ static void MX_TIM4_Init(void)
   {
     Error_Handler();
   }
-  sConfigOC.Pulse = 7999;
   if (HAL_TIM_PWM_ConfigChannel(&htim4, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
   {
     Error_Handler();
@@ -1126,6 +1245,8 @@ void Error_Handler(void)
   __disable_irq();
   while (1)
   {
+    HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+    HAL_Delay(40);
   }
   /* USER CODE END Error_Handler_Debug */
 }
