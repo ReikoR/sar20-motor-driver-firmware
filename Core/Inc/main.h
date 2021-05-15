@@ -62,14 +62,6 @@ void Error_Handler(void);
 /* Private defines -----------------------------------------------------------*/
 #define LED_Pin GPIO_PIN_3
 #define LED_GPIO_Port GPIOA
-#define DEBUG1_Pin GPIO_PIN_4
-#define DEBUG1_GPIO_Port GPIOA
-#define DEBUG2_Pin GPIO_PIN_5
-#define DEBUG2_GPIO_Port GPIOA
-#define DEBUG3_Pin GPIO_PIN_6
-#define DEBUG3_GPIO_Port GPIOA
-#define DEBUG4_Pin GPIO_PIN_7
-#define DEBUG4_GPIO_Port GPIOA
 #define DRV_EN_Pin GPIO_PIN_12
 #define DRV_EN_GPIO_Port GPIOA
 #define DRV_CS_Pin GPIO_PIN_15

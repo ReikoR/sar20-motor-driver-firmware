@@ -62,6 +62,16 @@ typedef struct __attribute__((packed)) DebugCommand {
   uint8_t checkSum;
 } DebugCommand;
 
+typedef struct __attribute__((packed)) Feedback {
+  uint16_t position;
+  uint16_t padding;
+  uint8_t padding2;
+} Feedback;
+
+typedef struct __attribute__((packed)) Command {
+  float speedHz;
+  uint8_t checkSum;
+} Command;
 
 enum ControlState {
   Idle,
@@ -87,7 +97,10 @@ ADC_HandleTypeDef hadc2;
 DMA_HandleTypeDef hdma_adc1;
 DMA_HandleTypeDef hdma_adc2;
 
+SPI_HandleTypeDef hspi1;
 SPI_HandleTypeDef hspi3;
+DMA_HandleTypeDef hdma_spi1_rx;
+DMA_HandleTypeDef hdma_spi1_tx;
 DMA_HandleTypeDef hdma_spi3_rx;
 DMA_HandleTypeDef hdma_spi3_tx;
 
@@ -114,8 +127,9 @@ static void MX_TIM1_Init(void);
 static void MX_TIM6_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_ADC2_Init(void);
+static void MX_SPI1_Init(void);
 /* USER CODE BEGIN PFP */
-
+static void EXTI_NSS_Init(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -198,6 +212,8 @@ uint16_t positionSensorRxData[1];
 uint8_t uartRxDataDMA[6] = {0, 0, 0, 0, 0, 0};
 uint8_t uartRxData[6] = {0, 0, 0, 0, 0, 0};
 
+uint8_t spiReceiveData[5] = {0, 0, 0, 0, 0};
+
 uint16_t zeroOffset = 6800;
 const int polePairs = 7;
 //const int mechCounts = 65536;
@@ -216,6 +232,7 @@ uint16_t adcOffsets[2] = {1965, 1965};
 
 int isMeasuringCurrentOffsets = 0;
 const uint32_t maxAdcOffsetSum = 80000000; // should take about 2s at 20kHz
+const uint32_t maxAdcOffsetCounts = 10000;
 uint32_t adcOffsetSums[3] = {0, 0, 0};
 uint32_t adcOffsetCounts[3] = {0, 0, 0};
 
@@ -274,6 +291,8 @@ SinCosResult scAngleCalibration = {.c = 0.0f, .s = 0.0f};
 float angleCalibrationDirection = 1.0f;
 int angleAtZeroCounter = 0;
 
+int hasReceivedSPICommand = 0;
+
 volatile DebugInfo debugInfo = {
     .rawPositionSensorValue = 0,
     .mechAngleRaw = 0,
@@ -296,12 +315,21 @@ volatile DebugCommand debugCommand = {
     .checkSum = 0
 };
 
+volatile Command command = {
+    .speedHz = 0.0f,
+    .checkSum = 0
+};
+
+volatile Feedback feedback = {
+    .position = 0.0f,
+    .padding = 0,
+    .padding2 = 0
+};
+
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
   if (hadc != &hadc1) {
     return;
   }
-
-  DEBUG1_GPIO_Port->BSRR = DEBUG1_Pin;
 
   if (isMeasuringCurrentOffsets) {
     adcOffsetSums[0] += adcData[0];
@@ -309,7 +337,10 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
     adcOffsetCounts[0] += 1;
     adcOffsetCounts[1] += 1;
 
-    if (adcOffsetSums[0] > maxAdcOffsetSum || adcOffsetSums[1] > maxAdcOffsetSum) {
+    if (
+        adcOffsetSums[0] > maxAdcOffsetSum || adcOffsetSums[1] > maxAdcOffsetSum
+        || adcOffsetCounts[0] >= maxAdcOffsetCounts
+    ) {
       isMeasuringCurrentOffsets = 0;
 
       adcOffsets[0] = adcOffsetSums[0] / adcOffsetCounts[0];
@@ -329,6 +360,8 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
   deltaPosition = position - prevPosition;
   WindowedAverage_Add(&speedWindowedAverage, deltaPosition);
   speed_Hz = 0.96f * speed_Hz + 0.04f * (float)speedWindowedAverage.total_ * velocity_scale * kRateHz / (float)speedWindowedAverage.size_;
+
+  feedback.position = position;
 
   if (controlState < CalibratingAngle) {
     return;
@@ -360,7 +393,7 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 
   //iqRef = 0.2f;
   if (controlState == CalibratingAngle) {
-    idRef = angleCalibrationCurrent;
+    idRef = isCalibratingAngle ? angleCalibrationCurrent : 0.0f;
     iqRef = 0.0f;
 
     angleCalibrationSetpoint += angleCalibrationDirection * 0.01f;
@@ -433,8 +466,24 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
   /*IM1->CCR1 = 0;
   TIM1->CCR2 = 0;
   TIM1->CCR3 = 0;*/
+}
 
-  DEBUG1_GPIO_Port->BRR = DEBUG1_Pin;
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+  __HAL_DMA_DISABLE(&hdma_spi1_rx);
+  hdma_spi1_rx.DmaBaseAddress->IFCR = (DMA_ISR_GIF1 << (hdma_spi1_rx.ChannelIndex & 0x1FU));
+  hdma_spi1_rx.Instance->CNDTR = 5;
+  __HAL_DMA_ENABLE_IT(&hdma_spi1_rx, (DMA_IT_TC | DMA_IT_HT | DMA_IT_TE));
+  __HAL_DMA_ENABLE(&hdma_spi1_rx);
+  SET_BIT(hspi1.Instance->CR2, SPI_CR2_RXDMAEN);
+
+  __HAL_DMA_DISABLE(&hdma_spi1_tx);
+  hdma_spi1_tx.DmaBaseAddress->IFCR = (DMA_ISR_GIF1 << (hdma_spi1_tx.ChannelIndex & 0x1FU));
+  hdma_spi1_tx.Instance->CNDTR = 5;
+  __HAL_DMA_ENABLE_IT(&hdma_spi1_tx, (DMA_IT_TC | DMA_IT_HT | DMA_IT_TE));
+  __HAL_DMA_ENABLE(&hdma_spi1_tx);
+  SET_BIT(hspi1.Instance->CR2, SPI_CR2_TXDMAEN);
+
+  hasReceivedSPICommand = 1;
 }
 
 void startAngleSensor() {
@@ -494,6 +543,7 @@ void setControlState(enum ControlState newControlState) {
     break;
   case CalibratingAngle:
     isCalibratingAngle = 1;
+    angleAtZeroCounter = 0;
     startAngleSensor();
     break;
   case Active:
@@ -533,6 +583,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  EXTI_NSS_Init();
   MX_DMA_Init();
   MX_SPI3_Init();
   MX_TIM4_Init();
@@ -541,6 +592,7 @@ int main(void)
   MX_TIM6_Init();
   MX_ADC1_Init();
   MX_ADC2_Init();
+  MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
   __HAL_SPI_ENABLE(&hspi3);
 
@@ -606,6 +658,13 @@ int main(void)
   HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);
   HAL_TIM_OC_Start(&htim4, TIM_CHANNEL_2);
 
+  // PA4 - EXTI4
+  SYSCFG->EXTICR[1] &= ~(0xf); // clear bits
+  EXTI->IMR1 |= GPIO_PIN_4; // interrupt enable
+  EXTI->RTSR1 |= GPIO_PIN_4; // rising sense
+
+  HAL_SPI_TransmitReceive_DMA(&hspi1, &feedback, &spiReceiveData, sizeof(spiReceiveData));
+
   setControlState(CalibratingDriver);
   /* USER CODE END 2 */
 
@@ -648,22 +707,45 @@ int main(void)
     }
 
     if (calculatedCheckSum == uartRxData[sizeof(uartRxData) - 1]) {
+      debugInfo.driverRegister1 = calculatedCheckSum;
       uint8_t prevCalibrateAngle = debugCommand.calibrateAngle;
 
       memcpy(&debugCommand, uartRxData, sizeof(uartRxData));
-
-      speedRef = debugCommand.speedHz;
+      if (!isnan(debugCommand.speedHz)) {
+        speedRef = debugCommand.speedHz;
+      }
 
       if (prevCalibrateAngle == 0 && debugCommand.calibrateAngle == 1) {
         setControlState(CalibratingAngle);
-      } else if (controlState == Ready && speedRef != 0.0f) {
+      } else if (controlState == Ready && debugCommand.speedHz != 0.0f) {
         setControlState(Active);
+      }
+    }
+
+    if (hasReceivedSPICommand) {
+      hasReceivedSPICommand = 0;
+
+      calculatedCheckSum = 0;
+
+      for (uint32_t i = 0; i < sizeof(spiReceiveData) - 1; i++) {
+        calculatedCheckSum += spiReceiveData[i];
+      }
+
+      if (calculatedCheckSum == spiReceiveData[sizeof(spiReceiveData) - 1]) {
+        memcpy(&command, spiReceiveData, sizeof(spiReceiveData));
+        if (!isnan(command.speedHz)) {
+          speedRef = command.speedHz;
+        }
+
+        if (controlState == Ready && command.speedHz != 0.0f) {
+          setControlState(Active);
+        }
       }
     }
 
     HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
 
-    debugInfo.driverRegister1 = zeroOffset;
+    //debugInfo.driverRegister1 = controlState;
     debugInfo.rawPositionSensorValue = positionSensorRxData[0];
     debugInfo.mechAngleRaw = mechAngleRaw;
     debugInfo.deltaPosition = deltaPosition;
@@ -871,6 +953,45 @@ static void MX_ADC2_Init(void)
   /* USER CODE BEGIN ADC2_Init 2 */
 
   /* USER CODE END ADC2_Init 2 */
+
+}
+
+/**
+  * @brief SPI1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI1_Init(void)
+{
+
+  /* USER CODE BEGIN SPI1_Init 0 */
+
+  /* USER CODE END SPI1_Init 0 */
+
+  /* USER CODE BEGIN SPI1_Init 1 */
+
+  /* USER CODE END SPI1_Init 1 */
+  /* SPI1 parameter configuration*/
+  hspi1.Instance = SPI1;
+  hspi1.Init.Mode = SPI_MODE_SLAVE;
+  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi1.Init.NSS = SPI_NSS_HARD_INPUT;
+  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial = 7;
+  hspi1.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
+  hspi1.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI1_Init 2 */
+
+  /* USER CODE END SPI1_Init 2 */
 
 }
 
@@ -1173,6 +1294,7 @@ static void MX_DMA_Init(void)
   /* DMA controller clock enable */
   __HAL_RCC_DMAMUX1_CLK_ENABLE();
   __HAL_RCC_DMA1_CLK_ENABLE();
+  __HAL_RCC_DMA2_CLK_ENABLE();
 
   /* DMA interrupt init */
   /* DMA1_Channel1_IRQn interrupt configuration */
@@ -1193,6 +1315,12 @@ static void MX_DMA_Init(void)
   /* DMA1_Channel6_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel6_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel6_IRQn);
+  /* DMA2_Channel1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Channel1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Channel1_IRQn);
+  /* DMA2_Channel2_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Channel2_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Channel2_IRQn);
 
 }
 
@@ -1210,13 +1338,10 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, LED_Pin|DEBUG1_Pin|DEBUG2_Pin|DEBUG3_Pin
-                          |DEBUG4_Pin|DRV_EN_Pin|DRV_CS_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, LED_Pin|DRV_EN_Pin|DRV_CS_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : LED_Pin DEBUG1_Pin DEBUG2_Pin DEBUG3_Pin
-                           DEBUG4_Pin DRV_EN_Pin DRV_CS_Pin */
-  GPIO_InitStruct.Pin = LED_Pin|DEBUG1_Pin|DEBUG2_Pin|DEBUG3_Pin
-                          |DEBUG4_Pin|DRV_EN_Pin|DRV_CS_Pin;
+  /*Configure GPIO pins : LED_Pin DRV_EN_Pin DRV_CS_Pin */
+  GPIO_InitStruct.Pin = LED_Pin|DRV_EN_Pin|DRV_CS_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -1231,7 +1356,30 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+/**
+  * @brief EXTI on NSS pin
+  * @param None
+  * @retval None
+  */
+static void EXTI_NSS_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
 
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+
+  /*Configure GPIO pin : PA4 */
+  GPIO_InitStruct.Pin = GPIO_PIN_4;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI4_IRQn, 1, 0);
+  HAL_NVIC_EnableIRQ(EXTI4_IRQn);
+
+
+}
 /* USER CODE END 4 */
 
 /**
