@@ -108,6 +108,7 @@ DMA_HandleTypeDef hdma_spi3_tx;
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim4;
 TIM_HandleTypeDef htim6;
+TIM_HandleTypeDef htim15;
 DMA_HandleTypeDef hdma_tim4_ch2;
 
 UART_HandleTypeDef huart1;
@@ -129,6 +130,7 @@ static void MX_TIM6_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_ADC2_Init(void);
 static void MX_SPI1_Init(void);
+static void MX_TIM15_Init(void);
 /* USER CODE BEGIN PFP */
 static void EXTI_NSS_Init(void);
 /* USER CODE END PFP */
@@ -332,6 +334,20 @@ volatile Feedback feedback = {
     .padding = 0,
     .padding2 = 0
 };
+
+/**
+ * @brief Sets LED frequency and duty cycle
+ * @param frequency LED PWM frequency in decihertz (dHz)
+ * @param duty LED PWM duty cycle in percent (0 - 100)
+ * @retval None
+ */
+void setLEDPWM(uint32_t frequency_dHz, uint32_t duty) {
+  uint32_t counts = 64000;
+
+  TIM15->PSC = min(SystemCoreClock * 10 / counts / frequency_dHz - 1, 65535);
+  TIM15->ARR = counts - 1;
+  TIM15->CCR2 = min(counts * (100 - duty) / 100, counts - 1);
+}
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
   if (hadc != &hadc1) {
@@ -617,6 +633,7 @@ void setControlState(enum ControlState newControlState) {
 
   switch (newControlState) {
   case Idle:
+    setLEDPWM(200, 5);
     stopMotorDriver();
     speedRef = 0.0f;
     PI_Control_reset(&speedPI);
@@ -626,6 +643,7 @@ void setControlState(enum ControlState newControlState) {
     speed_Hz = 0.0f;
     break;
   case CalibratingDriver:
+    setLEDPWM(100, 10);
     stopAngleSensor();
     startMotorDriver();
 
@@ -635,15 +653,18 @@ void setControlState(enum ControlState newControlState) {
 
     break;
   case Ready:
+    setLEDPWM(50, 10);
     WindowedAverage_Init(&speedWindowedAverage);
     startAngleSensor();
     break;
   case CalibratingAngle:
+    setLEDPWM(100, 50);
     isCalibratingAngle = 1;
     angleAtZeroCounter = 0;
     startAngleSensor();
     break;
   case Active:
+    setLEDPWM(20, 5);
     startAngleSensor();
     break;
   }
@@ -687,8 +708,12 @@ int main(void)
   MX_ADC1_Init();
   MX_ADC2_Init();
   MX_SPI1_Init();
+  MX_TIM15_Init();
   /* USER CODE BEGIN 2 */
   __HAL_SPI_ENABLE(&hspi3);
+
+  setLEDPWM(10, 5);
+  HAL_TIM_PWM_Start(&htim15, TIM_CHANNEL_2);
 
   HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);
   HAL_TIM_OC_Start(&htim4, TIM_CHANNEL_2);
@@ -846,8 +871,6 @@ int main(void)
     }
 
     prevBusV = busV;
-
-    HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
 
     debugInfo.driverRegister1 = controlState;
     debugInfo.rawPositionSensorValue = positionSensorRxData[0];
@@ -1342,6 +1365,72 @@ static void MX_TIM6_Init(void)
 }
 
 /**
+  * @brief TIM15 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM15_Init(void)
+{
+
+  /* USER CODE BEGIN TIM15_Init 0 */
+
+  /* USER CODE END TIM15_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
+
+  /* USER CODE BEGIN TIM15_Init 1 */
+
+  /* USER CODE END TIM15_Init 1 */
+  htim15.Instance = TIM15;
+  htim15.Init.Prescaler = 249;
+  htim15.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim15.Init.Period = 63999;
+  htim15.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim15.Init.RepetitionCounter = 0;
+  htim15.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_PWM_Init(&htim15) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim15, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 32000;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+  if (HAL_TIM_PWM_ConfigChannel(&htim15, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+  sBreakDeadTimeConfig.DeadTime = 0;
+  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+  sBreakDeadTimeConfig.BreakFilter = 0;
+  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
+  if (HAL_TIMEx_ConfigBreakDeadTime(&htim15, &sBreakDeadTimeConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM15_Init 2 */
+
+  /* USER CODE END TIM15_Init 2 */
+  HAL_TIM_MspPostInit(&htim15);
+
+}
+
+/**
   * @brief USART1 Initialization Function
   * @param None
   * @retval None
@@ -1442,10 +1531,10 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, LED_Pin|DRV_EN_Pin|DRV_CS_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, DRV_EN_Pin|DRV_CS_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : LED_Pin DRV_EN_Pin DRV_CS_Pin */
-  GPIO_InitStruct.Pin = LED_Pin|DRV_EN_Pin|DRV_CS_Pin;
+  /*Configure GPIO pins : DRV_EN_Pin DRV_CS_Pin */
+  GPIO_InitStruct.Pin = DRV_EN_Pin|DRV_CS_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -1495,11 +1584,10 @@ void Error_Handler(void)
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
-  while (1)
-  {
-    HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
-    HAL_Delay(40);
-  }
+
+  setLEDPWM(200, 50);
+
+  while (1) {}
   /* USER CODE END Error_Handler_Debug */
 }
 
