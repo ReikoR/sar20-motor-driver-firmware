@@ -27,6 +27,7 @@
 #include "pid.h"
 #include "windowed_average.h"
 #include "eeprom_emul.h"
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -57,7 +58,8 @@ typedef struct __attribute__((packed)) DebugInfo {
 } DebugInfo;
 
 typedef struct __attribute__((packed)) DebugCommand {
-  uint16_t startBytes;
+  uint8_t startByte;
+  uint8_t requestInfo;
   float speedHz;
   uint8_t calibrateAngle;
   uint8_t checkSum;
@@ -226,7 +228,6 @@ const float fElecCounts = 9362.2857f; // 2^16 / 7
 const uint16_t elecCounts = 9362;
 volatile float fElecAngle = 0.0f;
 volatile float busV = 0.0f;
-volatile float prevBusV = 0.0f;
 const float turnOffBusV = 7.0f;
 const float turnOnBusV = 9.0f;
 
@@ -298,8 +299,8 @@ SinCosResult scAngleCalibration = {.c = 0.0f, .s = 0.0f};
 float angleCalibrationDirection = 1.0f;
 int angleAtZeroCounter = 0;
 
-int hasReceivedSPICommand = 0;
-int hasReceivedUARTCommand = 0;
+volatile int hasReceivedSPICommand = 0;
+volatile int hasReceivedUARTCommand = 0;
 
 volatile DebugInfo debugInfo = {
     .rawPositionSensorValue = 0,
@@ -317,14 +318,15 @@ volatile DebugInfo debugInfo = {
     .delimiter = 0xAAAA
 };
 
-volatile DebugCommand debugCommand = {
-    .startBytes = 0,
+DebugCommand debugCommand = {
+    .startByte = 0,
+    .requestInfo = 0,
     .speedHz = 0.0f,
     .calibrateAngle = 0,
     .checkSum = 0
 };
 
-volatile Command command = {
+Command command = {
     .speedHz = 0.0f,
     .checkSum = 0
 };
@@ -654,6 +656,7 @@ void setControlState(enum ControlState newControlState) {
     break;
   case Ready:
     setLEDPWM(50, 10);
+    speedRef = 0.0f;
     WindowedAverage_Init(&speedWindowedAverage);
     startAngleSensor();
     break;
@@ -767,6 +770,7 @@ int main(void)
   HAL_SPI_TransmitReceive_DMA(&hspi1, &feedback, &spiReceiveData, sizeof(spiReceiveData));
 
   uint8_t calculatedCheckSum = 0;
+  int shouldSendDebugInfo = 0;
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -779,8 +783,6 @@ int main(void)
     if (busV <= turnOffBusV && controlState != Idle) {
       setControlState(Idle);
     }
-
-    HAL_Delay(100);
 
     if (hasReceivedUARTCommand) {
       hasReceivedUARTCommand = 0;
@@ -809,18 +811,26 @@ int main(void)
 
         memcpy(&debugCommand, uartRxData, sizeof(uartRxData));
 
-        if (debugCommand.startBytes == 0xAAAA) {
+        if (debugCommand.startByte == 0xAA) {
+          shouldSendDebugInfo = debugCommand.requestInfo;
+
           if (prevCalibrateAngle == 0 && debugCommand.calibrateAngle == 1) {
             setControlState(CalibratingAngle);
-          } else {
+          } else if (controlState == Ready || controlState == Active) {
             speedRef = debugCommand.speedHz;
 
-            if (controlState == Ready && debugCommand.speedHz != 0.0f) {
+            if (debugCommand.speedHz != 0.0f) {
               setControlState(Active);
             }
           }
         }
       }
+
+      shouldSendDebugInfo = 1;
+    }
+
+    if (!hasReceivedUARTCommand) {
+      HAL_UART_Receive_DMA(&huart1, &uartRxDataDMA, sizeof(uartRxDataDMA));
     }
 
     if (hasReceivedSPICommand) {
@@ -835,17 +845,19 @@ int main(void)
       if (calculatedCheckSum == spiReceiveData[sizeof(spiReceiveData) - 1]) {
         memcpy(&command, spiReceiveData, sizeof(spiReceiveData));
 
-        speedRef = command.speedHz;
+        if (controlState == Ready || controlState == Active) {
+          speedRef = command.speedHz;
 
-        if (controlState == Ready && command.speedHz != 0.0f) {
-          setControlState(Active);
+          if (command.speedHz != 0.0f) {
+            setControlState(Active);
+          }
         }
       }
     }
 
     switch (controlState) {
     case Idle:
-      if (prevBusV < turnOnBusV && busV >= turnOnBusV) {
+      if (busV >= turnOnBusV) {
         setControlState(CalibratingDriver);
       }
       break;
@@ -870,31 +882,33 @@ int main(void)
       break;
     }
 
-    prevBusV = busV;
+    if (shouldSendDebugInfo) {
+      shouldSendDebugInfo = 0;
 
-    debugInfo.driverRegister1 = controlState;
-    debugInfo.rawPositionSensorValue = positionSensorRxData[0];
-    debugInfo.mechAngleRaw = mechAngleRaw;
-    debugInfo.deltaPosition = deltaPosition;
-    debugInfo.prevPosition = prevPosition;
-    debugInfo.position = position;
-    debugInfo.aDuty = aDuty;
-    debugInfo.bDuty = bDuty;
-    debugInfo.cDuty = cDuty;
-    debugInfo.aVoltage = adcData[0];
-    debugInfo.bVoltage = adcData[2];
-    debugInfo.busVoltage = adcData[1];
-    debugInfo.aVoltageOffset = adcOffsets[0];
-    debugInfo.bVoltageOffset = adcOffsets[1];
-    debugInfo.speedHz = speed_Hz;
-    debugInfo.aI = aI;
-    debugInfo.bI = bI;
-    debugInfo.cI = cI;
-    debugInfo.dI = dqI.d;
-    debugInfo.qI = dqI.q;
-    debugInfo.nFault = HAL_GPIO_ReadPin(nFAULT_GPIO_Port, nFAULT_Pin);
+      debugInfo.driverRegister1 = controlState;
+      debugInfo.rawPositionSensorValue = positionSensorRxData[0];
+      debugInfo.mechAngleRaw = mechAngleRaw;
+      debugInfo.deltaPosition = deltaPosition;
+      debugInfo.prevPosition = prevPosition;
+      debugInfo.position = position;
+      debugInfo.aDuty = aDuty;
+      debugInfo.bDuty = bDuty;
+      debugInfo.cDuty = cDuty;
+      debugInfo.aVoltage = adcData[0];
+      debugInfo.bVoltage = adcData[2];
+      debugInfo.busVoltage = adcData[1];
+      debugInfo.aVoltageOffset = adcOffsets[0];
+      debugInfo.bVoltageOffset = adcOffsets[1];
+      debugInfo.speedHz = speed_Hz;
+      debugInfo.aI = aI;
+      debugInfo.bI = bI;
+      debugInfo.cI = cI;
+      debugInfo.dI = dqI.d;
+      debugInfo.qI = dqI.q;
+      debugInfo.nFault = HAL_GPIO_ReadPin(nFAULT_GPIO_Port, nFAULT_Pin);
 
-    HAL_UART_Transmit(&huart1, &debugInfo, sizeof(debugInfo), 0xffffff);
+      HAL_UART_Transmit(&huart1, &debugInfo, sizeof(debugInfo), 0xffffff);
+    }
   }
   /* USER CODE END 3 */
 }
