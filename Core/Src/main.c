@@ -57,6 +57,7 @@ typedef struct __attribute__((packed)) DebugInfo {
 } DebugInfo;
 
 typedef struct __attribute__((packed)) DebugCommand {
+  uint16_t startBytes;
   float speedHz;
   uint8_t calibrateAngle;
   uint8_t checkSum;
@@ -209,8 +210,8 @@ enum ControlState controlState = Idle;
 uint16_t positionSensorTxData[1] = {0x0000};
 uint16_t positionSensorRxData[1];
 
-uint8_t uartRxDataDMA[6] = {0, 0, 0, 0, 0, 0};
-uint8_t uartRxData[6] = {0, 0, 0, 0, 0, 0};
+uint8_t uartRxDataDMA[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+uint8_t uartRxData[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 
 uint8_t spiReceiveData[5] = {0, 0, 0, 0, 0};
 
@@ -222,7 +223,10 @@ uint16_t mechAngleRaw = 0;
 const float fElecCounts = 9362.2857f; // 2^16 / 7
 const uint16_t elecCounts = 9362;
 volatile float fElecAngle = 0.0f;
-float busV = 12.0f;
+volatile float busV = 0.0f;
+volatile float prevBusV = 0.0f;
+const float turnOffBusV = 7.0f;
+const float turnOnBusV = 9.0f;
 
 //adcRefV * voltageDividerRatio / adcCounts; busV = adcValue / 4095 * 3.3 * (24.9 + 4.99) / 4.99;
 const float ratioAdcToBusV = 0.004835f;
@@ -235,6 +239,7 @@ const uint32_t maxAdcOffsetSum = 80000000; // should take about 2s at 20kHz
 const uint32_t maxAdcOffsetCounts = 10000;
 uint32_t adcOffsetSums[3] = {0, 0, 0};
 uint32_t adcOffsetCounts[3] = {0, 0, 0};
+int areCurrentOffsetsMeasured = 0;
 
 // adcRefV / (shuntR * opampGain * adcCounts), gain = 20, shunt = 0.1
 const float ratioAdcToPhaseI = 4.0293e-4f;
@@ -292,6 +297,7 @@ float angleCalibrationDirection = 1.0f;
 int angleAtZeroCounter = 0;
 
 int hasReceivedSPICommand = 0;
+int hasReceivedUARTCommand = 0;
 
 volatile DebugInfo debugInfo = {
     .rawPositionSensorValue = 0,
@@ -310,6 +316,7 @@ volatile DebugInfo debugInfo = {
 };
 
 volatile DebugCommand debugCommand = {
+    .startBytes = 0,
     .speedHz = 0.0f,
     .calibrateAngle = 0,
     .checkSum = 0
@@ -331,6 +338,8 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
     return;
   }
 
+  busV = (float)adcData[1] * ratioAdcToBusV;
+
   if (isMeasuringCurrentOffsets) {
     adcOffsetSums[0] += adcData[0];
     adcOffsetSums[1] += adcData[2];
@@ -342,6 +351,7 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
         || adcOffsetCounts[0] >= maxAdcOffsetCounts
     ) {
       isMeasuringCurrentOffsets = 0;
+      areCurrentOffsetsMeasured = 1;
 
       adcOffsets[0] = adcOffsetSums[0] / adcOffsetCounts[0];
       adcOffsets[1] = adcOffsetSums[1] / adcOffsetCounts[1];
@@ -350,18 +360,16 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
     return;
   }
 
-  if (controlState < Ready) {
-    return;
+  if (isAngleSensorActive) {
+    mechAngleRaw = positionSensorRxData[0];
+    prevPosition = position;
+    position = mechAngleRaw - zeroOffset;
+    deltaPosition = position - prevPosition;
+    WindowedAverage_Add(&speedWindowedAverage, deltaPosition);
+    speed_Hz = 0.96f * speed_Hz + 0.04f * (float)speedWindowedAverage.total_ * velocity_scale * kRateHz / (float)speedWindowedAverage.size_;
+
+    feedback.position = position;
   }
-
-  mechAngleRaw = positionSensorRxData[0];
-  prevPosition = position;
-  position = mechAngleRaw - zeroOffset;
-  deltaPosition = position - prevPosition;
-  WindowedAverage_Add(&speedWindowedAverage, deltaPosition);
-  speed_Hz = 0.96f * speed_Hz + 0.04f * (float)speedWindowedAverage.total_ * velocity_scale * kRateHz / (float)speedWindowedAverage.size_;
-
-  feedback.position = position;
 
   if (controlState < CalibratingAngle) {
     return;
@@ -384,8 +392,6 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
   aI = (float)((int32_t)adcData[0] - (int32_t)adcOffsets[0]) * ratioAdcToPhaseI;
   bI = (float)((int32_t)adcData[2] - (int32_t)adcOffsets[1]) * ratioAdcToPhaseI;
   cI = -aI - bI;
-
-  busV = (float)adcData[1] * ratioAdcToBusV;
 
   //InverseDqTransform(&sc, 0.0f, 0.8f, &abc); // voltage
 
@@ -486,6 +492,28 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
   hasReceivedSPICommand = 1;
 }
 
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+  hasReceivedUARTCommand = 1;
+}
+
+HAL_StatusTypeDef DMA_Stop(DMA_HandleTypeDef *hdma)
+{
+  HAL_StatusTypeDef status = HAL_OK;
+
+  /* Process locked */
+  __HAL_LOCK(hdma);
+
+  /* Disable the peripheral */
+  __HAL_DMA_DISABLE(hdma);
+
+  hdma->State = HAL_DMA_STATE_READY;
+
+  /* Process Unlocked */
+  __HAL_UNLOCK(hdma);
+
+  return status;
+}
+
 void startAngleSensor() {
   if (isAngleSensorActive) {
     return;
@@ -511,6 +539,73 @@ void startAngleSensor() {
 
   SPI_TransmitReceive_DMA_Setup(&hspi3, (uint32_t)positionSensorTxData, (uint32_t)positionSensorRxData, 1);
   HAL_DMA_Start(&hdma_tim4_ch2, positionSensorTxData, (uint32_t)&SPI3->DR, 1);
+
+  htim4.Instance->CCR1 = 32;
+  htim4.Instance->CCR2 = 64;
+}
+
+void stopAngleSensor() {
+  if (!isAngleSensorActive) {
+      return;
+    }
+
+  isAngleSensorActive = 0;
+
+  /* Disable Rx DMA Request */
+  CLEAR_BIT(hspi3.Instance->CR2, SPI_CR2_RXDMAEN);
+
+  DMA_Stop(hspi3.hdmarx);
+
+  DMA_Stop(&hdma_tim4_ch2);
+
+  htim4.Instance->CCR1 = 0;
+  htim4.Instance->CCR2 = 0;
+}
+
+void startMotorDriver() {
+  aDuty = 0;
+  bDuty = 0;
+  cDuty = 0;
+
+  TIM1->CCR1 = 0;
+  TIM1->CCR2 = 0;
+  TIM1->CCR3 = 0;
+
+  HAL_GPIO_WritePin(DRV_EN_GPIO_Port, DRV_EN_Pin, GPIO_PIN_SET); // enable DRV8323
+
+  HAL_Delay(1); // SPI ready after enable < 1ms
+
+  // Change SPI frequency to 2.5 MHz for motor driver
+  MODIFY_REG(hspi3.Instance->CR1, SPI_CR1_BR_Msk, SPI_BAUDRATEPRESCALER_64);
+
+  // Change SPI mode from 0 to 1
+  MODIFY_REG(hspi3.Instance->CR1, SPI_CR1_CPHA_Msk, SPI_PHASE_2EDGE);
+
+  HAL_Delay(1);
+
+  DRV8323_writeRegister(
+      &hspi3,
+      DRV_CS_GPIO_Port,
+      DRV_CS_Pin,
+      DRV8323_RegisterAddress_driver_control,
+      DRV8323_driver_control_PWM_mode_3x
+  );
+
+  TIM1->CCR1 = 2000;
+  TIM1->CCR2 = 2000;
+  TIM1->CCR3 = 2000;
+}
+
+void stopMotorDriver() {
+  HAL_GPIO_WritePin(DRV_EN_GPIO_Port, DRV_EN_Pin, GPIO_PIN_RESET); // disable DRV8323
+
+  aDuty = 0;
+  bDuty = 0;
+  cDuty = 0;
+
+  TIM1->CCR1 = 0;
+  TIM1->CCR2 = 0;
+  TIM1->CCR3 = 0;
 }
 
 void setControlState(enum ControlState newControlState) {
@@ -518,27 +613,29 @@ void setControlState(enum ControlState newControlState) {
     return;
   }
 
+  controlState = newControlState;
+
   switch (newControlState) {
   case Idle:
+    stopMotorDriver();
+    speedRef = 0.0f;
+    PI_Control_reset(&speedPI);
+    PI_Control_reset(&idPI);
+    PI_Control_reset(&iqPI);
+    WindowedAverage_Init(&speedWindowedAverage);
+    speed_Hz = 0.0f;
     break;
   case CalibratingDriver:
-    /*DRV8323_writeRegister(
-        &hspi3,
-        DRV_CS_GPIO_Port,
-        DRV_CS_Pin,
-        DRV8323_RegisterAddress_CSA_control,
-        DRV8323_CSA_control_bidirectional_mode |
-        DRV8323_CSA_control_gain_20 |
-        DRV8323_CSA_control_CAL_A_enabled |
-        DRV8323_CSA_control_CAL_B_enabled |
-        DRV8323_CSA_control_CAL_C_enabled |
-        DRV8323_CSA_control_sense_overcurrent_level_1V
-    );*/
+    stopAngleSensor();
+    startMotorDriver();
 
-    isMeasuringCurrentOffsets = 1;
+    if (!areCurrentOffsetsMeasured) {
+      isMeasuringCurrentOffsets = 1;
+    }
 
     break;
   case Ready:
+    WindowedAverage_Init(&speedWindowedAverage);
     startAngleSensor();
     break;
   case CalibratingAngle:
@@ -550,8 +647,6 @@ void setControlState(enum ControlState newControlState) {
     startAngleSensor();
     break;
   }
-
-  controlState = newControlState;
 }
 /* USER CODE END 0 */
 
@@ -578,12 +673,11 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-
+  EXTI_NSS_Init();
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  EXTI_NSS_Init();
   MX_DMA_Init();
   MX_SPI3_Init();
   MX_TIM4_Init();
@@ -599,24 +693,6 @@ int main(void)
   HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);
   HAL_TIM_OC_Start(&htim4, TIM_CHANNEL_2);
 
-  HAL_GPIO_WritePin(DRV_EN_GPIO_Port, DRV_EN_Pin, GPIO_PIN_SET); // enable DRV8323
-
-  HAL_Delay(1); // SPI ready after enable < 1ms
-
-  DRV8323_writeRegister(
-      &hspi3,
-      DRV_CS_GPIO_Port,
-      DRV_CS_Pin,
-      DRV8323_RegisterAddress_driver_control,
-      DRV8323_driver_control_PWM_mode_3x
-  );
-
-  /*uint16_t driverControlRegisterValue = DRV8323_readRegister(
-      &hspi3,
-      DRV_CS_GPIO_Port,
-      DRV_CS_Pin,
-      DRV8323_RegisterAddress_driver_control
-  );*/
   EE_Status ee_status = EE_OK;
 
   HAL_FLASH_Unlock();
@@ -628,8 +704,8 @@ int main(void)
 
   HAL_FLASH_Lock();
 
-  htim4.Instance->CCR1 = 32;
-  htim4.Instance->CCR2 = 64;
+  htim4.Instance->CCR1 = 0;
+  htim4.Instance->CCR2 = 0;
 
   HAL_ADC_Start_DMA(&hadc2, adcData + 2, 1);
 
@@ -665,7 +741,7 @@ int main(void)
 
   HAL_SPI_TransmitReceive_DMA(&hspi1, &feedback, &spiReceiveData, sizeof(spiReceiveData));
 
-  setControlState(CalibratingDriver);
+  uint8_t calculatedCheckSum = 0;
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -675,50 +751,50 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    if (busV <= turnOffBusV && controlState != Idle) {
+      setControlState(Idle);
+    }
+
     HAL_Delay(100);
 
-    if (controlState == CalibratingDriver && isMeasuringCurrentOffsets == 0) {
-      // Current offset calibration has ended
-      setControlState(Ready);
-    } else if (controlState == CalibratingAngle && isCalibratingAngle == 0) {
-      // Angle calibration has ended
-      HAL_FLASH_Unlock();
-      EE_WriteVariable16bits(1, zeroOffset);
-      HAL_FLASH_Lock();
-      setControlState(Ready);
-    }
+    if (hasReceivedUARTCommand) {
+      hasReceivedUARTCommand = 0;
 
-    uint32_t uartRxDMACounter = __HAL_DMA_GET_COUNTER(huart1.hdmarx);
-    uint32_t firstByteIndex = sizeof(uartRxData) - uartRxDMACounter;
-    uint8_t calculatedCheckSum = 0;
+      calculatedCheckSum = 0;
 
-    for (uint32_t i = 0; i < sizeof(uartRxData); i++) {
-      uint32_t byteIndex = firstByteIndex + i;
+      uint32_t uartRxDMACounter = __HAL_DMA_GET_COUNTER(huart1.hdmarx);
+      uint32_t firstByteIndex = sizeof(uartRxData) - uartRxDMACounter;
 
-      if (byteIndex >= sizeof(uartRxData)) {
-        byteIndex -= sizeof(uartRxData);
+      for (uint32_t i = 0; i < sizeof(uartRxData); i++) {
+        uint32_t byteIndex = firstByteIndex + i;
+
+        if (byteIndex >= sizeof(uartRxData)) {
+          byteIndex -= sizeof(uartRxData);
+        }
+
+        uartRxData[i] = uartRxDataDMA[byteIndex];
+
+        if (i != sizeof(uartRxData) - 1) {
+          calculatedCheckSum += uartRxData[i];
+        }
       }
 
-      uartRxData[i] = uartRxDataDMA[byteIndex];
+      if (calculatedCheckSum == uartRxData[sizeof(uartRxData) - 1]) {
+        uint8_t prevCalibrateAngle = debugCommand.calibrateAngle;
 
-      if (i != sizeof(uartRxData) - 1) {
-        calculatedCheckSum += uartRxData[i];
-      }
-    }
+        memcpy(&debugCommand, uartRxData, sizeof(uartRxData));
 
-    if (calculatedCheckSum == uartRxData[sizeof(uartRxData) - 1]) {
-      debugInfo.driverRegister1 = calculatedCheckSum;
-      uint8_t prevCalibrateAngle = debugCommand.calibrateAngle;
+        if (debugCommand.startBytes == 0xAAAA) {
+          if (prevCalibrateAngle == 0 && debugCommand.calibrateAngle == 1) {
+            setControlState(CalibratingAngle);
+          } else {
+            speedRef = debugCommand.speedHz;
 
-      memcpy(&debugCommand, uartRxData, sizeof(uartRxData));
-      if (!isnan(debugCommand.speedHz)) {
-        speedRef = debugCommand.speedHz;
-      }
-
-      if (prevCalibrateAngle == 0 && debugCommand.calibrateAngle == 1) {
-        setControlState(CalibratingAngle);
-      } else if (controlState == Ready && debugCommand.speedHz != 0.0f) {
-        setControlState(Active);
+            if (controlState == Ready && debugCommand.speedHz != 0.0f) {
+              setControlState(Active);
+            }
+          }
+        }
       }
     }
 
@@ -733,9 +809,8 @@ int main(void)
 
       if (calculatedCheckSum == spiReceiveData[sizeof(spiReceiveData) - 1]) {
         memcpy(&command, spiReceiveData, sizeof(spiReceiveData));
-        if (!isnan(command.speedHz)) {
-          speedRef = command.speedHz;
-        }
+
+        speedRef = command.speedHz;
 
         if (controlState == Ready && command.speedHz != 0.0f) {
           setControlState(Active);
@@ -743,9 +818,38 @@ int main(void)
       }
     }
 
+    switch (controlState) {
+    case Idle:
+      if (prevBusV < turnOnBusV && busV >= turnOnBusV) {
+        setControlState(CalibratingDriver);
+      }
+      break;
+    case CalibratingDriver:
+      if (!isMeasuringCurrentOffsets) {
+        // Current offset calibration has ended
+        setControlState(Ready);
+      }
+      break;
+    case CalibratingAngle:
+      if (!isCalibratingAngle) {
+        // Angle calibration has ended
+        HAL_FLASH_Unlock();
+        EE_WriteVariable16bits(1, zeroOffset);
+        HAL_FLASH_Lock();
+        setControlState(Ready);
+      }
+      break;
+    case Ready:
+      break;
+    case Active:
+      break;
+    }
+
+    prevBusV = busV;
+
     HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
 
-    //debugInfo.driverRegister1 = controlState;
+    debugInfo.driverRegister1 = controlState;
     debugInfo.rawPositionSensorValue = positionSensorRxData[0];
     debugInfo.mechAngleRaw = mechAngleRaw;
     debugInfo.deltaPosition = deltaPosition;
