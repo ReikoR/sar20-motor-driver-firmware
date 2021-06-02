@@ -58,10 +58,8 @@ typedef struct __attribute__((packed)) DebugInfo {
 } DebugInfo;
 
 typedef struct __attribute__((packed)) DebugCommand {
-  uint8_t startByte;
-  uint8_t requestInfo;
   float speedHz;
-  uint8_t calibrateAngle;
+  uint8_t commandBits;
   uint8_t checkSum;
 } DebugCommand;
 
@@ -109,7 +107,6 @@ DMA_HandleTypeDef hdma_spi3_tx;
 
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim4;
-TIM_HandleTypeDef htim6;
 TIM_HandleTypeDef htim15;
 DMA_HandleTypeDef hdma_tim4_ch2;
 
@@ -128,7 +125,6 @@ static void MX_SPI3_Init(void);
 static void MX_TIM4_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_TIM1_Init(void);
-static void MX_TIM6_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_ADC2_Init(void);
 static void MX_SPI1_Init(void);
@@ -214,8 +210,7 @@ enum ControlState controlState = Idle;
 uint16_t positionSensorTxData[1] = {0x0000};
 uint16_t positionSensorRxData[1];
 
-uint8_t uartRxDataDMA[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-uint8_t uartRxData[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+uint8_t uartRxData[6] = {0, 0, 0, 0, 0, 0};
 
 uint8_t spiReceiveData[5] = {0, 0, 0, 0, 0};
 
@@ -319,10 +314,8 @@ volatile DebugInfo debugInfo = {
 };
 
 DebugCommand debugCommand = {
-    .startByte = 0,
-    .requestInfo = 0,
     .speedHz = 0.0f,
-    .calibrateAngle = 0,
+    .commandBits = 0,
     .checkSum = 0
 };
 
@@ -707,7 +700,6 @@ int main(void)
   MX_TIM4_Init();
   MX_USART1_UART_Init();
   MX_TIM1_Init();
-  MX_TIM6_Init();
   MX_ADC1_Init();
   MX_ADC2_Init();
   MX_SPI1_Init();
@@ -740,7 +732,7 @@ int main(void)
   HAL_ADC_Start_DMA(&hadc1, adcData, 2);
   HAL_ADC_Start_IT(&hadc1);
 
-  HAL_UART_Receive_DMA(&huart1, &uartRxDataDMA, sizeof(uartRxDataDMA));
+  HAL_UART_Receive_DMA(&huart1, &uartRxData, sizeof(uartRxData));
 
   // sets offset before timer is started to align TIM4 CH2 DMA request that triggers SPI3 data transfer,
   // should happen after the ADC sampling is done and before ADC sequence end interrupt
@@ -789,48 +781,25 @@ int main(void)
 
       calculatedCheckSum = 0;
 
-      uint32_t uartRxDMACounter = __HAL_DMA_GET_COUNTER(huart1.hdmarx);
-      uint32_t firstByteIndex = sizeof(uartRxData) - uartRxDMACounter;
-
-      for (uint32_t i = 0; i < sizeof(uartRxData); i++) {
-        uint32_t byteIndex = firstByteIndex + i;
-
-        if (byteIndex >= sizeof(uartRxData)) {
-          byteIndex -= sizeof(uartRxData);
-        }
-
-        uartRxData[i] = uartRxDataDMA[byteIndex];
-
-        if (i != sizeof(uartRxData) - 1) {
-          calculatedCheckSum += uartRxData[i];
-        }
+      for (uint32_t i = 0; i < sizeof(uartRxData) - 1; i++) {
+        calculatedCheckSum += uartRxData[i];
       }
 
       if (calculatedCheckSum == uartRxData[sizeof(uartRxData) - 1]) {
-        uint8_t prevCalibrateAngle = debugCommand.calibrateAngle;
+        uint8_t prevCalibrateAngle = debugCommand.commandBits & 0x04;
 
         memcpy(&debugCommand, uartRxData, sizeof(uartRxData));
 
-        if (debugCommand.startByte == 0xAA) {
-          shouldSendDebugInfo = debugCommand.requestInfo;
+        shouldSendDebugInfo = debugCommand.commandBits & 0x02;
 
-          if (prevCalibrateAngle == 0 && debugCommand.calibrateAngle == 1) {
-            setControlState(CalibratingAngle);
-          } else if (controlState == Ready || controlState == Active) {
-            speedRef = debugCommand.speedHz;
+        if (!prevCalibrateAngle && (debugCommand.commandBits & 0x04)) {
+          setControlState(CalibratingAngle);
+        } else if ((debugCommand.commandBits & 0x01) && (controlState == Ready || controlState == Active)) {
+          speedRef = debugCommand.speedHz;
 
-            if (debugCommand.speedHz != 0.0f) {
-              setControlState(Active);
-            }
-          }
+          setControlState(Active);
         }
       }
-
-      shouldSendDebugInfo = 1;
-    }
-
-    if (!hasReceivedUARTCommand) {
-      HAL_UART_Receive_DMA(&huart1, &uartRxDataDMA, sizeof(uartRxDataDMA));
     }
 
     if (hasReceivedSPICommand) {
@@ -1341,44 +1310,6 @@ static void MX_TIM4_Init(void)
 }
 
 /**
-  * @brief TIM6 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM6_Init(void)
-{
-
-  /* USER CODE BEGIN TIM6_Init 0 */
-
-  /* USER CODE END TIM6_Init 0 */
-
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-
-  /* USER CODE BEGIN TIM6_Init 1 */
-
-  /* USER CODE END TIM6_Init 1 */
-  htim6.Instance = TIM6;
-  htim6.Init.Prescaler = 4;
-  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim6.Init.Period = 31999;
-  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM6_Init 2 */
-
-  /* USER CODE END TIM6_Init 2 */
-
-}
-
-/**
   * @brief TIM15 Initialization Function
   * @param None
   * @retval None
@@ -1514,7 +1445,7 @@ static void MX_DMA_Init(void)
   HAL_NVIC_SetPriority(DMA1_Channel3_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel3_IRQn);
   /* DMA1_Channel4_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Channel4_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Channel4_IRQn, 6, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel4_IRQn);
   /* DMA1_Channel5_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel5_IRQn, 0, 0);
@@ -1523,10 +1454,10 @@ static void MX_DMA_Init(void)
   HAL_NVIC_SetPriority(DMA1_Channel6_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel6_IRQn);
   /* DMA2_Channel1_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA2_Channel1_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA2_Channel1_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(DMA2_Channel1_IRQn);
   /* DMA2_Channel2_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA2_Channel2_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA2_Channel2_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(DMA2_Channel2_IRQn);
 
 }
